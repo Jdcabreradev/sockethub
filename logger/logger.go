@@ -25,6 +25,10 @@ import (
 	"time"
 )
 
+// =============================================================================
+// Log Level Types
+// =============================================================================
+
 // LogType represents different severity levels for log messages
 type LogType uint8
 
@@ -35,6 +39,10 @@ const (
 	DEBUG                  // Debugging messages (verbose output for development)
 )
 
+// =============================================================================
+// Log Output Modes
+// =============================================================================
+
 // LogMode controls how and where logs are output
 type LogMode uint8
 
@@ -44,6 +52,10 @@ const (
 	VERBOSE                // Console + file, all logs
 	HIDDEN                 // Console + file, INFO and ERROR only
 )
+
+// =============================================================================
+// ANSI Color Constants
+// =============================================================================
 
 // ANSI color codes for console output
 const (
@@ -56,14 +68,22 @@ const (
 	Cyan    = "\033[36m"
 )
 
+// =============================================================================
+// Application Configuration
+// =============================================================================
+
 // Application constants
 const (
-	module     = "[SocketHub]"
-	timeFormat = "2006-01-02 15:04:05"
-	bufferSize = 4096 // Buffer size for file writes
+	module     = "[SocketHub]"         // Default module identifier for log messages
+	timeFormat = "2006-01-02 15:04:05" // Standard timestamp format for log entries
+	bufferSize = 4096                  // Buffer size for file writes (4KB for optimal I/O performance)
 )
 
-// Pre-computed string constants for log types
+// =============================================================================
+// Pre-computed String Constants
+// =============================================================================
+
+// Pre-computed string constants for log types (array indexed by LogType for O(1) lookup)
 var logTypeStrings = [4]string{
 	INFO:    "INFO",
 	WARNING: "WARNING",
@@ -71,38 +91,50 @@ var logTypeStrings = [4]string{
 	DEBUG:   "DEBUG",
 }
 
+// =============================================================================
+// Logger Structure
+// =============================================================================
+
 // Logger handles all logging operations, including thread safety, output mode, and file management.
+// Optimized for high-performance concurrent logging with minimal allocations.
 type Logger struct {
-	mu      sync.RWMutex    // RWMutex for thread-safe access (read/write)
-	logFile *os.File        // File handle for log file (if enabled)
-	writer  *bufio.Writer   // Buffered writer for file output
-	colors  [4]string       // Array of colors indexed by LogType
-	mode    LogMode         // Current logging mode (DEV, RELEASE, etc.)
-	closed  bool            // Indicates if the logger has been closed
-	sb      strings.Builder // Pre-allocated string builder for efficiency
+	mu      sync.RWMutex    // RWMutex for thread-safe access (allows concurrent reads, exclusive writes)
+	logFile *os.File        // File handle for log file (nil in DEV mode)
+	writer  *bufio.Writer   // Buffered writer for file output (reduces system calls)
+	colors  [4]string       // Array of ANSI colors indexed by LogType for O(1) color lookup
+	mode    LogMode         // Current logging mode (DEV, RELEASE, VERBOSE, HIDDEN)
+	closed  bool            // Indicates if the logger has been closed (prevents use after close)
+	sb      strings.Builder // Pre-allocated string builder for efficient string concatenation
 }
 
-// NewLogger creates a new logger instance with specified directory and mode
+// =============================================================================
+// Logger Constructor
+// =============================================================================
+
+// NewLogger creates a new logger instance with specified directory and mode.
+// Creates log directory if it doesn't exist and opens timestamped log file for non-DEV modes.
+// Returns error if directory creation or file opening fails.
 func NewLogger(logDir string, mode LogMode) (*Logger, error) {
 	l := &Logger{
 		mode: mode,
 		colors: [4]string{
-			INFO:    Green,
-			WARNING: Yellow,
-			ERROR:   Red,
-			DEBUG:   Blue,
+			INFO:    Green,  // Green for informational messages
+			WARNING: Yellow, // Yellow for warnings
+			ERROR:   Red,    // Red for errors
+			DEBUG:   Blue,   // Blue for debug messages
 		},
 	}
 
-	// Pre-allocate string builder capacity
+	// Pre-allocate string builder capacity to reduce memory reallocations
 	l.sb.Grow(256)
 
-	// Create log file for non-DEV modes
+	// Create log file for non-DEV modes (DEV mode is console-only)
 	if mode != DEV {
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			return nil, fmt.Errorf("[SocketLog] failed to create log directory: %w", err)
 		}
 
+		// Generate timestamped filename for log rotation
 		filename := fmt.Sprintf("%s/%s.log", logDir, time.Now().Format("20060102_150405"))
 		file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -116,7 +148,13 @@ func NewLogger(logDir string, mode LogMode) (*Logger, error) {
 	return l, nil
 }
 
-// Log writes a log message based on the current mode and log type
+// =============================================================================
+// Core Logging Methods
+// =============================================================================
+
+// Log writes a log message based on the current mode and log type.
+// Uses fast-path optimization to avoid locking when message should be discarded.
+// Thread-safe and optimized for high-frequency logging.
 func (l *Logger) Log(consumer string, logType LogType, message string) {
 	// Fast path: check if we should log at all (no lock needed for read-only data)
 	shouldPrint, shouldSave := l.shouldLogFast(l.mode, logType)
@@ -124,7 +162,7 @@ func (l *Logger) Log(consumer string, logType LogType, message string) {
 		return
 	}
 
-	// Pre-format timestamp before any locking
+	// Pre-format timestamp before any locking to minimize lock contention
 	timestamp := time.Now().Format(timeFormat)
 
 	l.mu.Lock()
@@ -142,39 +180,45 @@ func (l *Logger) Log(consumer string, logType LogType, message string) {
 	l.mu.Unlock()
 }
 
+// =============================================================================
+// Log Behavior Decision Logic
+// =============================================================================
+
 // Pre-computed complete lookup table [mode][logType] -> [shouldPrint, shouldSave]
+// Provides O(1) decision making for log output behavior across all mode/type combinations
 var completeLogBehavior = [4][4][2]bool{
-	// DEV mode
+	// DEV mode: Console only, all log types enabled
 	{
-		INFO:    {true, false},
-		WARNING: {true, false},
-		ERROR:   {true, false},
-		DEBUG:   {true, false},
+		INFO:    {true, false}, // Print to console, don't save to file
+		WARNING: {true, false}, // Print to console, don't save to file
+		ERROR:   {true, false}, // Print to console, don't save to file
+		DEBUG:   {true, false}, // Print to console, don't save to file
 	},
-	// RELEASE mode
+	// RELEASE mode: Console + file, DEBUG disabled for production
 	{
-		INFO:    {true, true},
-		WARNING: {true, true},
-		ERROR:   {true, true},
-		DEBUG:   {false, false}, // DEBUG disabled in RELEASE
+		INFO:    {true, true},   // Print to console and save to file
+		WARNING: {true, true},   // Print to console and save to file
+		ERROR:   {true, true},   // Print to console and save to file
+		DEBUG:   {false, false}, // DEBUG disabled in RELEASE mode
 	},
-	// VERBOSE mode
+	// VERBOSE mode: Console + file, all log types enabled
 	{
-		INFO:    {true, true},
-		WARNING: {true, true},
-		ERROR:   {true, true},
-		DEBUG:   {true, true},
+		INFO:    {true, true}, // Print to console and save to file
+		WARNING: {true, true}, // Print to console and save to file
+		ERROR:   {true, true}, // Print to console and save to file
+		DEBUG:   {true, true}, // Print to console and save to file
 	},
-	// HIDDEN mode
+	// HIDDEN mode: Console + file, only INFO and ERROR shown
 	{
-		INFO:    {true, true},
-		WARNING: {false, false}, // WARNING disabled in HIDDEN
-		ERROR:   {true, true},
-		DEBUG:   {false, false}, // DEBUG disabled in HIDDEN
+		INFO:    {true, true},   // Print to console and save to file
+		WARNING: {false, false}, // WARNING disabled in HIDDEN mode
+		ERROR:   {true, true},   // Print to console and save to file
+		DEBUG:   {false, false}, // DEBUG disabled in HIDDEN mode
 	},
 }
 
-// shouldLogFast uses complete lookup table for O(1) decision making
+// shouldLogFast uses complete lookup table for O(1) decision making.
+// Bounds checking prevents array access violations with invalid input.
 func (l *Logger) shouldLogFast(mode LogMode, logType LogType) (shouldPrint, shouldSave bool) {
 	if mode >= 4 || logType >= 4 {
 		return false, false
@@ -184,10 +228,16 @@ func (l *Logger) shouldLogFast(mode LogMode, logType LogType) (shouldPrint, shou
 	return behavior[0], behavior[1]
 }
 
-// printToConsole outputs colored log message to console using pre-allocated builder
+// =============================================================================
+// Output Formatting Methods
+// =============================================================================
+
+// printToConsole outputs colored log message to console using pre-allocated builder.
+// Format: [COLOR_TYPE] [TIMESTAMP] [MODULE] [CONSUMER] MESSAGE
+// Pre-calculates string capacity to avoid memory reallocations during formatting.
 func (l *Logger) printToConsole(timestamp, consumer string, logType LogType, message string) {
 	l.sb.Reset()
-	// Pre-calculate capacity to avoid reallocations
+	// Pre-calculate capacity to avoid reallocations during string building
 	capacity := 1 + len(l.colors[logType]) + len(logTypeStrings[logType]) + len(Reset) +
 		3 + len(timestamp) + 2 + len(module) + 2 + len(consumer) + 2 + len(message) + 1
 	if l.sb.Cap() < capacity {
@@ -211,14 +261,16 @@ func (l *Logger) printToConsole(timestamp, consumer string, logType LogType, mes
 	fmt.Print(l.sb.String())
 }
 
-// saveToFile writes log message to file using pre-allocated builder
+// saveToFile writes log message to file using pre-allocated builder.
+// Format: [TYPE] [TIMESTAMP] [MODULE] [CONSUMER] MESSAGE (no ANSI colors for file output)
+// Pre-calculates string capacity to avoid memory reallocations during formatting.
 func (l *Logger) saveToFile(timestamp, consumer string, logType LogType, message string) {
 	if l.writer == nil {
 		return
 	}
 
 	l.sb.Reset()
-	// Pre-calculate capacity to avoid reallocations
+	// Pre-calculate capacity to avoid reallocations during string building
 	capacity := 1 + len(logTypeStrings[logType]) + 3 + len(timestamp) + 2 +
 		len(module) + 2 + len(consumer) + 2 + len(message) + 1
 	if l.sb.Cap() < capacity {
@@ -242,7 +294,12 @@ func (l *Logger) saveToFile(timestamp, consumer string, logType LogType, message
 	}
 }
 
-// Flush forces any buffered log data to be written to disk
+// =============================================================================
+// Logger Management Methods
+// =============================================================================
+
+// Flush forces any buffered log data to be written to disk.
+// Should be called periodically or before application shutdown to ensure log persistence.
 func (l *Logger) Flush() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -253,7 +310,9 @@ func (l *Logger) Flush() error {
 	return nil
 }
 
-// Close safely closes the logger and releases resources
+// Close safely closes the logger and releases resources.
+// Flushes any remaining buffered data and closes file handles.
+// Logger becomes unusable after Close() is called.
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -264,14 +323,14 @@ func (l *Logger) Close() error {
 
 	l.closed = true
 
-	// Flush and close writer
+	// Flush and close writer to ensure all data is written
 	if l.writer != nil {
 		if err := l.writer.Flush(); err != nil {
 			return fmt.Errorf("failed to flush buffer: %w", err)
 		}
 	}
 
-	// Close file
+	// Close file handle to release system resources
 	if l.logFile != nil {
 		if err := l.logFile.Close(); err != nil {
 			return fmt.Errorf("failed to close log file: %w", err)
@@ -281,7 +340,13 @@ func (l *Logger) Close() error {
 	return nil
 }
 
-// SetColor allows changing the color for a specific log type
+// =============================================================================
+// Configuration Methods
+// =============================================================================
+
+// SetColor allows changing the ANSI color for a specific log type.
+// Only accepts predefined ANSI color constants for safety.
+// Thread-safe operation with mutex protection.
 func (l *Logger) SetColor(logType LogType, color string) {
 	if logType >= 4 {
 		return
@@ -290,7 +355,7 @@ func (l *Logger) SetColor(logType LogType, color string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Direct comparison instead of loop
+	// Direct comparison instead of loop for better performance
 	switch color {
 	case Red, Green, Yellow, Blue, Magenta, Cyan:
 		l.colors[logType] = color
